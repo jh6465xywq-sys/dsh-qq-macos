@@ -1,0 +1,206 @@
+diff --git a/src/long-memory.js b/src/long-memory.js
+new file mode 100644
+index 0000000..a48fabd
+--- /dev/null
++++ b/src/long-memory.js
+@@ -0,0 +1,200 @@
++// 长期记忆：用硅基流动（SiliconFlow）的 embedding 模型把「关于某人的事实」编码成向量，
++// 之后按语义相似度检索，而不是靠关键词匹配。
++//
++// 为什么不用关键词：聊天里问「她还喜欢猫吗」和存的「养了只橘猫，叫豆豆」没有共同词，
++// 关键词检索必然漏；向量检索能命中。
++//
++// 存储结构（state/long-memory.json）：
++//   { version: 1, entries: [{ id, key, text, vector: number[], time, source }] }
++// 条目数按 key（会话/人）分组上限收敛，避免越存越大。
++
++import fs from 'node:fs';
++import path from 'node:path';
++
++const DEFAULTS = {
++  enabled: true,
++  baseUrl: 'https://api.siliconflow.cn/v1',
++  model: 'BAAI/bge-m3',
++  apiKey: '',
++  maxEntriesPerKey: 400,
++  minScore: 0.32,
++  topK: 5
++};
++
++function cosine(a, b) {
++  let dot = 0;
++  let na = 0;
++  let nb = 0;
++  const len = Math.min(a.length, b.length);
++  for (let i = 0; i < len; i += 1) {
++    dot += a[i] * b[i];
++    na += a[i] * a[i];
++    nb += b[i] * b[i];
++  }
++  if (!na || !nb) return 0;
++  return dot / (Math.sqrt(na) * Math.sqrt(nb));
++}
++
++function normalizeText(text) {
++  return String(text ?? '').replace(/\s+/g, ' ').trim();
++}
++
++export class LongMemory {
++  /**
++   * @param {object} options
++   * @param {string} options.stateDir  状态目录
++   * @param {object} options.config    config.longMemory
++   * @param {(msg: string) => void} [options.log]
++   */
++  constructor({ stateDir, config = {}, log = () => {} }) {
++    this.file = path.join(stateDir, 'long-memory.json');
++    this.cfg = { ...DEFAULTS, ...(config || {}) };
++    this.log = log;
++    this.entries = [];
++    this.dirty = false;
++    this.load();
++  }
++
++  get apiKey() {
++    return String(this.cfg.apiKey || process.env.SILICONFLOW_API_KEY || '').trim();
++  }
++
++  get ready() {
++    return Boolean(this.cfg.enabled !== false && this.apiKey);
++  }
++
++  load() {
++    try {
++      if (!fs.existsSync(this.file)) return;
++      const raw = JSON.parse(fs.readFileSync(this.file, 'utf8'));
++      const list = Array.isArray(raw?.entries) ? raw.entries : [];
++      this.entries = list.filter((e) => e && Array.isArray(e.vector) && e.vector.length > 0);
++      this.log(`[long-memory] 载入 ${this.entries.length} 条`);
++    } catch (error) {
++      this.log(`[long-memory] 载入失败（忽略）：${error?.message ?? error}`);
++      this.entries = [];
++    }
++  }
++
++  save() {
++    if (!this.dirty) return;
++    try {
++      fs.mkdirSync(path.dirname(this.file), { recursive: true });
++      const tmp = `${this.file}.tmp`;
++      fs.writeFileSync(tmp, JSON.stringify({ version: 1, entries: this.entries }), 'utf8');
++      fs.renameSync(tmp, this.file);
++      this.dirty = false;
++    } catch (error) {
++      this.log(`[long-memory] 保存失败：${error?.message ?? error}`);
++    }
++  }
++
++  async embed(text) {
++    const input = normalizeText(text);
++    if (!input) throw new Error('文本为空');
++    const base = String(this.cfg.baseUrl || DEFAULTS.baseUrl).replace(/\/+$/, '');
++    const res = await fetch(`${base}/embeddings`, {
++      method: 'POST',
++      headers: { 'content-type': 'application/json', authorization: `Bearer ${this.apiKey}` },
++      body: JSON.stringify({ model: this.cfg.model || DEFAULTS.model, input }),
++      signal: AbortSignal.timeout(20000)
++    });
++    const body = await res.json().catch(() => ({}));
++    if (!res.ok) {
++      throw new Error(`embedding 请求失败 HTTP ${res.status}：${body?.message || body?.error?.message || ''}`.trim());
++    }
++    const vec = body?.data?.[0]?.embedding;
++    if (!Array.isArray(vec) || !vec.length) throw new Error('embedding 返回为空');
++    return vec;
++  }
++
++  /** 记住一条事实。返回 { id, duplicate } */
++  async remember({ key, text, source = 'chat' }) {
++    if (!this.ready) throw new Error('长期记忆未启用或未配置 API Key');
++    const clean = normalizeText(text);
++    if (!clean) throw new Error('内容为空');
++    if (clean.length > 500) throw new Error('单条记忆请控制在 500 字以内');
++
++    const vector = await this.embed(clean);
++
++    // 同一个人已有的近似记忆直接跳过，避免重复占用额度
++    const same = this.entries.filter((e) => e.key === key);
++    for (const e of same) {
++      if (cosine(vector, e.vector) >= 0.96) {
++        return { id: e.id, duplicate: true, text: e.text };
++      }
++    }
++
++    const entry = {
++      id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`,
++      key,
++      text: clean,
++      vector,
++      time: new Date().toISOString(),
++      source
++    };
++    this.entries.push(entry);
++
++    // 按 key 收敛条数，淘汰最旧的
++    const mine = this.entries.filter((e) => e.key === key);
++    const limit = Math.max(20, Number(this.cfg.maxEntriesPerKey) || DEFAULTS.maxEntriesPerKey);
++    if (mine.length > limit) {
++      const drop = new Set(mine.slice(0, mine.length - limit).map((e) => e.id));
++      this.entries = this.entries.filter((e) => !drop.has(e.id));
++    }
++
++    this.dirty = true;
++    this.save();
++    return { id: entry.id, duplicate: false, text: entry.text };
++  }
++
++  /** 语义检索。返回按相似度降序的 [{ text, score, time }] */
++  async recall({ key, query, topK }) {
++    if (!this.ready) throw new Error('长期记忆未启用或未配置 API Key');
++    const mine = this.entries.filter((e) => e.key === key);
++    if (!mine.length) return [];
++    const q = normalizeText(query);
++    if (!q) return [];
++    const qv = await this.embed(q);
++    const minScore = Number.isFinite(Number(this.cfg.minScore)) ? Number(this.cfg.minScore) : DEFAULTS.minScore;
++    const k = Math.min(20, Math.max(1, Number(topK) || this.cfg.topK || DEFAULTS.topK));
++    return mine
++      .map((e) => ({ text: e.text, score: cosine(qv, e.vector), time: e.time, id: e.id }))
++      .filter((x) => x.score >= minScore)
++      .sort((a, b) => b.score - a.score)
++      .slice(0, k);
++  }
++
++  list(key) {
++    return this.entries
++      .filter((e) => e.key === key)
++      .map((e) => ({ id: e.id, text: e.text, time: e.time, source: e.source }))
++      .sort((a, b) => String(b.time).localeCompare(String(a.time)));
++  }
++
++  forget({ key, id, query }) {
++    const before = this.entries.length;
++    if (id) {
++      this.entries = this.entries.filter((e) => !(e.key === key && e.id === id));
++    } else if (query) {
++      const q = normalizeText(query);
++      this.entries = this.entries.filter((e) => !(e.key === key && e.text.includes(q)));
++    } else {
++      this.entries = this.entries.filter((e) => e.key !== key);
++    }
++    const removed = before - this.entries.length;
++    if (removed) {
++      this.dirty = true;
++      this.save();
++    }
++    return removed;
++  }
++
++  stats() {
++    const byKey = {};
++    for (const e of this.entries) byKey[e.key] = (byKey[e.key] || 0) + 1;
++    return { total: this.entries.length, byKey, enabled: this.ready, model: this.cfg.model };
++  }
++}
++
++export default LongMemory;

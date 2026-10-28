@@ -1,0 +1,85 @@
+{
+  "dsh": {
+    "baseUrl": "http://127.0.0.1:<每次重启都会变，用 scripts/find-dsh-port.py>",
+    "provider": "deepseek-account",
+    "model": "deepseek-flash",
+    "reasoningEffort": "off",
+    "authToken": "<填你自己的>",
+    "authHeader": "authorization",
+    "authPrefix": "Bearer",
+    "allowRemote": false
+  },
+  "role": {
+    "maxInjectChars": 6000
+  },
+  "snowluma": {
+    "wsUrl": "ws://127.0.0.1:3001",
+    "httpUrl": "http://127.0.0.1:3000",
+    "accessToken": "<填你自己的>",
+    "followDiscoveredEndpoint": true,
+    "silenceWarnMs": 600000,
+    "launcherPath": "",
+    "homeDir": "",
+    "httpBase": "http://127.0.0.1:3000"
+  },
+  "ownerQQ": "<你自己的大号 QQ 号>",
+  "sessionCwd": "<你的家目录>/Ai WorkSpace",
+  "agentPreset": "qq-chat",
+  "workspaceTitle": "QQ 聊天",
+  "allow": {
+    "private": [
+      "<你自己的大号 QQ 号>"
+    ],
+    "groups": []
+  },
+  "deny": {
+    "private": [],
+    "groups": []
+  },
+  "allowAllWhenEmpty": false,
+  "ackMessage": "",
+  "sendDelayMs": 300,
+  "questionTimeoutMs": 300000,
+  "consolePort": 3100,
+  "consoleToken": "<填你自己的>",
+  "mode": "closed-agent",
+  "longMemory": {
+    "enabled": true,
+    "baseUrl": "https://api.siliconflow.cn/v1",
+    "model": "BAAI/bge-m3",
+    "apiKey": "<填你自己的>",
+    "maxEntriesPerKey": 400,
+    "minScore": 0.32,
+    "topK": 5
+  },
+  "socialV2": {
+    "voice": {
+      "enabled": true,
+      "sendVoice": true,
+      "tts": {
+        "engine": "gptsovits",
+        "apiBase": "http://127.0.0.1:9880",
+        "refAudio": "<绝对路径>/ref.wav",
+        "promptText": "<参考音频里说的那句话，逐字一致>",
+        "textLang": "zh",
+        "promptLang": "zh",
+        "splitMethod": "cut5",
+        "bin": "<你的家目录>/dafeiyu/tts-venv/bin/edge-tts",
+        "voice": "zh-CN-XiaoyiNeural",
+        "rate": "+8%",
+        "temperature": 0.7,
+        "topK": 10,
+        "topP": 0.85,
+        "speedFactor": 1.0
+      },
+      "strategy": {
+        "enabled": true,
+        "groupProbability": 0.15,
+        "privateProbability": 0.3
+      }
+    },
+    "tools": {
+      "sendVoice": true
+    }
+  }
+}

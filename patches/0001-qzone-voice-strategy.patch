@@ -1,0 +1,321 @@
+diff --git a/src/bridge.js b/src/bridge.js
+index 9340068..f834b6a 100644
+--- a/src/bridge.js
++++ b/src/bridge.js
+@@ -10,7 +10,8 @@ import os from 'node:os';
+ import http from 'node:http';
+ import path from 'node:path';
+ import crypto from 'node:crypto';
+-import { execFileSync } from 'node:child_process';
++import { execFileSync, execFile } from 'node:child_process';
++import { promisify } from 'node:util';
+ import yaml from 'js-yaml';
+ import { extractPresetPrefix, presetPromptBlockers, presetPromptWarnings, renderPresetPromptYaml } from './preset-prompt.js';
+ import { GEN1_ROLE_LINE_RE, parseRoleSections, roleCharStats, roleSectionReport, selectRoleText } from './role-card.js';
+@@ -27,6 +28,7 @@ import { AUDIO_EXTS, cleanupTemp, describeAudio, formatBytes, formatDuration, in
+ import { discoverSnowLumaConnection, persistSnowLumaEndpoint, persistToken } from './snowluma-conn.js';
+ import { hardenDir, manualDirCommand } from './state-acl.mjs';
+ import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
++import { LongMemory } from './long-memory.js';
+ import { resolvePriceTable } from './model-prices.js';
+ import { createTokenLedger } from './token-ledger.js';
+ import {
+@@ -56,6 +58,7 @@ import {
+ } from './sticker-lib.js';
+ 
+ const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const execFileAsync = promisify(execFile);
+ const ROOT = path.resolve(__dirname, '..');
+ const STATE_DIR = path.join(ROOT, 'state');
+ const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
+@@ -572,9 +575,9 @@ let modelCatalogInFlight = null;
+ // 放在模块级是为了不依赖 main() 内部声明的执行顺序（避免 TDZ）。
+ let modelSelectionEpoch = 0;
+ // DeepSeek provider 明确支持的取值（见 dsh-llm-deepseek：其它值会抛 UNSUPPORTED_REASONING_EFFORT）。
+-// 'off' 虽然合法（关闭思考），但 QQ 聊天助手依赖思考，控制台不提供该档。
+-const REASONING_EFFORT_OPTIONS = ['low', 'high', 'max'];
+-const REASONING_EFFORT_DEFAULT = 'max';
++// 本机给大肥鱼用：默认 'off'（闲聊不需要思考，快且省；需要深想时控制台可临时调 low/high/max）。
++const REASONING_EFFORT_OPTIONS = ['off', 'low', 'high', 'max'];
++const REASONING_EFFORT_DEFAULT = 'off';
+ function normalizeReasoningEffort(value) {
+   const v = String(value ?? '').trim().toLowerCase();
+   if (!REASONING_EFFORT_OPTIONS.includes(v)) {
+@@ -688,6 +691,8 @@ function loadConfig() {
+     },
+     // 私聊/群聊均未配置白名单时是否放行所有（true 时启动会打警告）
+     allowAllWhenEmpty: file.allowAllWhenEmpty === true,
++    // 长期记忆（硅基流动 embedding + 向量检索）
++    longMemory: file.longMemory ?? {},
+     ackMessage: file.ackMessage ?? '🤔 收到，正在思考…',
+     sendDelayMs: file.sendDelayMs ?? 300,
+     questionTimeoutMs: file.questionTimeoutMs ?? 5 * 60 * 1000,
+@@ -1389,6 +1394,13 @@ async function main() {
+   acquireLock();
+   loadState();
+ 
++  // ── 长期记忆（硅基流动 embedding + 向量检索） ──────────────────────────
++  // 与 qq_memory_* 那套"轻量记忆"（话题/想说的话/印象）不是一回事：
++  // 这里存的是关于某个人的长期事实，按语义检索，跨会话保留。
++  const longMemory = new LongMemory({ stateDir: STATE_DIR, config: cfg.longMemory, log });
++  if (longMemory.ready) log(`[long-memory] 已启用（${longMemory.stats().total} 条）`);
++  else if (cfg.longMemory?.apiKey === undefined) log('[long-memory] 未配置 API Key，功能待用');
++
+   // ── 群聊黑话/网络用语学习（slang） ──────────────────────────────────────
+   let slangEntries = [];
+   // 读失败时（被占用 / 权限 / JSON 损坏）必须**暂停写入**：否则内存里的空数组
+@@ -1751,7 +1763,15 @@ async function main() {
+ 
+     const assertSendAllowed = guard ? captureSendGuard(key) : null;
+     const [kind, id] = key.split(':');
+-    const recordSegment = { type: 'record', data: { file: sendPath } };
++    // SnowLuma 跑在 Docker 容器里，看不到宿主机的文件路径 —— 直接把绝对路径塞给
++    // OneBot，ENOENT 会发生在容器内（stat 不到文件）。所以音频一律内联成 base64；
++    // 语音条本身只有几十 KB，代价可以忽略，换来的是不依赖任何挂载配置。
++    let recordFile = sendPath;
++    try {
++      const size = fs.statSync(sendPath).size;
++      if (size <= 16 * 1024 * 1024) recordFile = `base64://${fs.readFileSync(sendPath).toString('base64')}`;
++    } catch { /* 读失败就让下游按原样报错，错误信息更有用 */ }
++    const recordSegment = { type: 'record', data: { file: recordFile } };
+     let resolveSend;
+     let rejectSend;
+     const sendPromise = new Promise((resolve, reject) => { resolveSend = resolve; rejectSend = reject; });
+@@ -1867,6 +1887,82 @@ async function main() {
+     }
+   }
+ 
++  /**
++   * 文字转语音：用 edge-tts（微软在线免费音色）生成 mp3，落到语音库目录。
++   *
++   * 为什么是 edge-tts：免费、不需要本地模型和显卡、中文女声自然（Xiaoyi/Xiaoxiao），
++   * 单句 2~4 秒出结果。生成的文件进 audio/ 之后，就和手动放进语音库的文件走同一条
++   * 发送链路（qq_send_voice），不用为 TTS 单独维护一套发送逻辑。
++   *
++   * 想换成声音克隆（GPT-SoVITS 之类）时，只要把 socialV2.voice.tts.bin 指向一个
++   * 「同样的参数生成音频文件」的脚本即可，其余代码不用动。
++   */
++  async function synthesizeSpeech(text, outPath) {
++    const tts = cfg.socialV2?.voice?.tts ?? {};
++    const engine = String(tts.engine || 'edge').toLowerCase();
++
++    // ── 引擎一：GPT-SoVITS 声音克隆（本机 api_v2.py，端口 9880）────────────
++    // 参考音频和它的台词走配置；首次调用要提取参考音频特征（2~20 秒），
++    // 之后同一段参考音频会命中进程内缓存，单句 2~4 秒。
++    if (engine === 'gptsovits') {
++      const apiBase = String(tts.apiBase || 'http://127.0.0.1:9880').replace(/\/+$/, '');
++      const refAudio = String(tts.refAudio || path.join(os.homedir(), 'dafeiyu', 'ref-clean.wav'));
++      const promptText = String(tts.promptText || '');
++      const payload = {
++        text: String(text),
++        text_lang: String(tts.textLang || 'zh'),
++        ref_audio_path: refAudio,
++        prompt_lang: String(tts.promptLang || 'zh'),
++        text_split_method: String(tts.splitMethod || 'cut5'),
++        batch_size: 1,
++        media_type: 'wav',
++        streaming_mode: false
++      };
++      if (promptText) payload.prompt_text = promptText;
++      // 咬字清晰度调参：温度和采样范围越低越"稳"，语速略慢更清楚。
++      // 这些在 GPT-SoVITS api_v2 里都支持，不传就是模型默认（temperature=1）。
++      if (tts.temperature != null) payload.temperature = Number(tts.temperature);
++      if (tts.topK != null) payload.top_k = Number(tts.topK);
++      if (tts.topP != null) payload.top_p = Number(tts.topP);
++      if (tts.speedFactor != null) payload.speed_factor = Number(tts.speedFactor);
++      let res;
++      try {
++        res = await fetch(`${apiBase}/tts`, {
++          method: 'POST',
++          headers: { 'content-type': 'application/json' },
++          body: JSON.stringify(payload),
++          signal: AbortSignal.timeout(120000)
++        });
++      } catch (error) {
++        throw new Error(`语音合成失败（GPT-SoVITS 连不上 ${apiBase}）：${String(error?.message ?? error).slice(0, 160)}`);
++      }
++      if (!res.ok) {
++        const detail = await res.text().catch(() => '');
++        throw new Error(`语音合成失败（GPT-SoVITS ${res.status}）：${detail.slice(0, 200)}`);
++      }
++      const buf = Buffer.from(await res.arrayBuffer());
++      if (buf.length < 1024) throw new Error('语音合成失败：GPT-SoVITS 返回的音频过小');
++      fs.writeFileSync(outPath, buf);
++      return { path: outPath, bytes: buf.length, voice: 'gptsovits-克隆' };
++    }
++
++    // ── 引擎二：edge-tts（免费在线音色，兜底用）───────────────────────────
++    const bin = String(tts.bin || process.env.BRIDGE_TTS_BIN || path.join(os.homedir(), 'dafeiyu', 'tts-venv', 'bin', 'edge-tts'));
++    const voice = String(tts.voice || 'zh-CN-XiaoyiNeural');
++    const rate = String(tts.rate || '+8%');
++    const args = ['--voice', voice, '--text', String(text), '--write-media', outPath];
++    if (rate) args.push('--rate', rate);
++    try {
++      await execFileAsync(bin, args, { timeout: 60000, maxBuffer: 4 * 1024 * 1024 });
++    } catch (error) {
++      throw new Error(`语音合成失败（${path.basename(bin)}）：${String(error?.stderr || error?.message || error).trim().slice(0, 200)}`);
++    }
++    let size = 0;
++    try { size = fs.statSync(outPath).size; } catch { size = 0; }
++    if (size < 1024) throw new Error('语音合成失败：生成的文件为空或过小');
++    return { path: outPath, bytes: size, voice };
++  }
++
+   /**
+    * AI 通道入口：解析引用 → 限流 → 发送 → 记账 → 回读校验。
+    * 返回 { messageId, detail, verified, readback }。
+@@ -6341,6 +6437,46 @@ async function main() {
+           sendJson({ ok: true });
+           return;
+         }
++        // ── QQ 空间（说说）───────────────────────────────────────────────
++        if (req.method === 'GET' && url.pathname === '/api/socialV2/qzone/list') {
++          if (req.headers['x-agent-token'] && !v2ToolEnabled('qzone')) { sendJson({ ok: false, error: '工具未启用：qq_qzone_list' }, 403); return; }
++          const pos = Math.max(0, Number(url.searchParams.get('pos')) || 0);
++          const num = Math.min(20, Math.max(1, Number(url.searchParams.get('num')) || 10));
++          try {
++            const res = await onebotHttpAction('get_qzone_msg_list', { pos, num });
++            sendJson({ ok: true, data: res.data ?? null });
++          } catch (error) {
++            // 新号从没发过说说时，QQ 返回的 msglist 是 null，SnowLuma 会当成"结构异常"抛错。
++            // 这对调用方就是"还没有说说"，不该是个错误。
++            const msg = String(error?.message ?? error);
++            if (msg.includes('msglist') || msg.includes('结构异常')) {
++              sendJson({ ok: true, data: { total: 0, msglist: [] } });
++              return;
++            }
++            sendJson({ ok: false, error: `读取说说失败：${msg}` }, 502);
++          }
++          return;
++        }
++        if (req.method === 'POST' && url.pathname === '/api/socialV2/qzone/send') {
++          const body = await readBody();
++          if (req.headers['x-agent-token'] && !v2ToolEnabled('qzone')) { sendJson({ ok: false, error: '工具未启用：qq_qzone_send' }, 403); return; }
++          const content = String(body.content ?? '').trim();
++          if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
++          const ugc = [1, 4, 16, 64, 128].includes(Number(body.ugc_right)) ? Number(body.ugc_right) : 1;
++          const params = { content, ugc_right: ugc };
++          if (Array.isArray(body.images) && body.images.length) params.images = body.images.slice(0, 9).map(String);
++          if ((ugc === 16 || ugc === 128) && Array.isArray(body.target_uins) && body.target_uins.length) {
++            params.target_uins = body.target_uins.slice(0, 50).map(Number).filter((n) => Number.isFinite(n));
++          }
++          try {
++            const res = await onebotHttpAction('send_qzone_msg', params, { timeoutMs: 60000 });
++            log(`[qzone] 已发说说（ugc_right=${ugc}，${content.length} 字）`);
++            sendJson({ ok: true, data: res.data ?? null });
++          } catch (error) {
++            sendJson({ ok: false, error: `发说说失败：${error?.message ?? error}` }, 502);
++          }
++          return;
++        }
+         if (req.method === 'POST' && url.pathname === '/api/socialV2/feedback') {
+           const body = await readBody();
+           const key = String(body.key ?? '').trim();
+@@ -6777,6 +6913,94 @@ async function main() {
+           sendJson({ ok: true, key, category: category || 'all', memory: formatMemoryV2(st) });
+           return;
+         }
++        // ── 长期记忆（硅基流动 embedding）：记住 / 想起来 / 查看 / 忘掉 ──────
++        if (req.method === 'POST' && url.pathname === '/api/socialV2/long-memory/add') {
++          const body = await readBody();
++          const key = String(body.key ?? '').trim();
++          const fact = String(body.text ?? '').trim();
++          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
++          if (!fact) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
++          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
++          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
++          if (req.headers['x-agent-token'] && !v2ToolEnabled('longMemory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_remember' }, 403); return; }
++          try {
++            const r = await longMemory.remember({ key, text: fact, source: 'chat' });
++            sendJson({ ok: true, ...r });
++          } catch (error) {
++            sendJson({ ok: false, error: `记不住：${error?.message ?? error}` }, 502);
++          }
++          return;
++        }
++        if (req.method === 'POST' && url.pathname === '/api/socialV2/long-memory/search') {
++          const body = await readBody();
++          const key = String(body.key ?? '').trim();
++          const query = String(body.query ?? '').trim();
++          if (!key || !query) { sendJson({ ok: false, error: 'key 和 query 不能为空' }, 400); return; }
++          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
++          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
++          if (req.headers['x-agent-token'] && !v2ToolEnabled('longMemory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_recall' }, 403); return; }
++          try {
++            const hits = await longMemory.recall({ key, query, topK: body.topK });
++            sendJson({ ok: true, hits });
++          } catch (error) {
++            sendJson({ ok: false, error: `想不起来：${error?.message ?? error}` }, 502);
++          }
++          return;
++        }
++        if (req.method === 'GET' && url.pathname === '/api/socialV2/long-memory') {
++          const key = String(url.searchParams.get('key') ?? '').trim();
++          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
++          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
++          sendJson({ ok: true, entries: longMemory.list(key), stats: longMemory.stats() });
++          return;
++        }
++        if (req.method === 'POST' && url.pathname === '/api/socialV2/long-memory/forget') {
++          const body = await readBody();
++          const key = String(body.key ?? '').trim();
++          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
++          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
++          const removed = longMemory.forget({ key, id: body.id, query: body.query });
++          sendJson({ ok: true, removed });
++          return;
++        }
++        // ── 语音：文字 → 合成 → 发语音条（一条链路） ────────────────────────
++        if (req.method === 'POST' && url.pathname === '/api/socialV2/speak') {
++          const body = await readBody();
++          const key = String(body.key ?? '').trim();
++          const sayText = String(body.text ?? '').trim();
++          if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
++          if (!sayText) { sendJson({ ok: false, error: 'text 不能为空' }, 400); return; }
++          if (sayText.length > 300) { sendJson({ ok: false, error: '一次最多说 300 字，长了不像人说话' }, 400); return; }
++          if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'agent token 无效' }, 403); return; }
++          if (req.headers['x-agent-token'] && !v2SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
++          if (req.headers['x-agent-token'] && !v2ToolEnabled('sendVoice')) { sendJson({ ok: false, error: '工具未启用：qq_speak' }, 403); return; }
++          const vc = voiceCfg();
++          if (!vc.enabled) { sendJson({ ok: false, error: '语音功能已关闭（socialV2.voice.enabled=false）' }, 403); return; }
++          const name = `tts-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}.mp3`;
++          let made;
++          try {
++            const dir = path.isAbsolute(vc.dir) ? vc.dir : path.join(ROOT, vc.dir);
++            fs.mkdirSync(dir, { recursive: true });
++            made = await synthesizeSpeech(sayText, path.join(dir, name));
++          } catch (error) {
++            sendJson({ ok: false, error: `说话失败：${error?.message ?? error}` }, 502);
++            return;
++          }
++          try {
++            const sent = await sendVoiceForV2(key, name, { label: sayText.slice(0, 40) });
++            // 只留最近 40 条合成音频，避免语音库被 TTS 文件撑爆
++            try {
++              const dir = path.isAbsolute(vc.dir) ? vc.dir : path.join(ROOT, vc.dir);
++              const olds = fs.readdirSync(dir).filter((f) => /^tts-.*\.mp3$/i.test(f)).map((f) => path.join(dir, f))
++                .map((p) => ({ p, t: fs.statSync(p).mtimeMs })).sort((a, b) => b.t - a.t).slice(40);
++              for (const o of olds) fs.unlinkSync(o.p);
++            } catch { /* 清理失败不影响发送 */ }
++            sendJson({ ok: true, ...sent, bytes: made.bytes, voice: made.voice, text: sayText });
++          } catch (error) {
++            sendJson({ ok: false, error: `发语音失败：${error?.message ?? error}` }, 502);
++          }
++          return;
++        }
+         // ── 二代黑话学习（reserved2）：AI 查询/提交黑话候选 ─────────────────
+         if (req.method === 'GET' && url.pathname === '/api/socialV2/slang/query') {
+           const key = String(url.searchParams.get('key') ?? '').trim();
+@@ -9153,6 +9377,12 @@ async function main() {
+       if (wakeSnapshot) {
+         promptText += `\n\n【本次消息快照】\n${JSON.stringify(wakeSnapshot)}\n以上消息已提供，无需重复查询；partial=true 时用 qq_get_unread_messages(afterSeq=readThroughSeq) 继续读取。先处理当前消息；回复前如需确认后续补充，用 qq_wait_for_messages(purpose="reply") 补足短静默，已安静够久会立即返回，不要先长等。收尾只确认你已处理的 readThroughSeq（本地 seq，非 QQ messageId），传给 qq_mark_read 或 qq_set_wake_config 的 throughSeq；新到消息留待处理。`;
+       }
++      const voiceStrategy = cfg.socialV2?.voice?.strategy;
++      if (voiceStrategy?.enabled !== false && cfg.socialV2?.voice?.enabled !== false) {
++        const isGroup = String(key).startsWith('group:');
++        const pct = Math.round((isGroup ? (voiceStrategy?.groupProbability ?? 0.15) : (voiceStrategy?.privateProbability ?? 0.3)) * 100);
++        promptText += `\n\n【语音权重】本轮发语音的机会约 ${pct}%（${isGroup ? '群聊' : '私聊'}）。只在道晚安/早安、撒娇、哄人、对方要语音、语气比文字重要这几种情况下才考虑；技术、报错、严肃或敏感话题一律打字。同一轮最多一条，别连着发。`;
++      }
+     }
+     let content = [{ type: 'text', text: withSlangContext(promptText) }];
+     if (Array.isArray(opts.media) && opts.media.length > 0) {

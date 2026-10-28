@@ -1,0 +1,30 @@
+# 敏感
+.env
+config.json
+*.key
+*.pem
+tokens/
+
+# 运行时
+state/
+data/
+logs/
+*.log
+*.out
+*.err
+node_modules/
+.venv/
+__pycache__/
+
+# 声音/素材（体积大且多为个人数据）
+*.wav
+*.mp3
+*.m4a
+*.aiff
+ref-*/
+stickers/
+stickers_small/
+
+# macOS
+.DS_Store
+._*

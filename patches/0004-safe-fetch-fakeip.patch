@@ -1,0 +1,38 @@
+diff --git a/src/safe-fetch.js b/src/safe-fetch.js
+index 535bcb1..d48432f 100644
+--- a/src/safe-fetch.js
++++ b/src/safe-fetch.js
+@@ -132,6 +132,19 @@ function orderAddresses(addresses) {
+   return ordered;
+ }
+ 
++/**
++ * 腾讯系静态资源 CDN 域名。这些 host 由腾讯控制、只提供图片/文件下载，
++ * 允许在「代理 fake-ip 导致解析到保留段」时仍然放行。
++ * 注意：只放行域名后缀，不放行任意 IP 直连。
++ */
++const TRUSTED_CDN_SUFFIXES = ['qpic.cn', 'qq.com', 'qq.com.cn', 'gtimg.cn', 'myqcloud.com', 'qcloudimg.com'];
++
++export function isTrustedCdnHost(hostname) {
++  const h = String(hostname || '').toLowerCase().replace(/\.$/, '');
++  if (!h) return false;
++  return TRUSTED_CDN_SUFFIXES.some((suffix) => h === suffix || h.endsWith(`.${suffix}`));
++}
++
+ /** 解析主机名并校验**全部**解析结果，返回可尝试的地址列表（IPv4 优先）。 */
+ export async function resolveSafeAddresses(hostname) {
+   const h = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '').replace(/\.$/, '');
+@@ -150,8 +163,13 @@ export async function resolveSafeAddresses(hostname) {
+     throw new Error(`域名解析失败：${error?.message ?? error}`);
+   }
+   if (!addresses.length) throw new Error('域名没有解析结果');
++  // 代理软件（Clash/Surge 等）的 fake-ip 模式会把**任意**域名解析到 198.18.x.x / 172.16-31.x.x
++  // 这类保留段，于是 QQ 的图片 CDN 会被误判成内网而全部拦死。host 是固定的腾讯 CDN 域名时，
++  // 解析结果不可信但也不构成 SSRF 风险（攻击者无法让 qq.com 指向任意内网服务），放行。
++  const trustedCdn = isTrustedCdnHost(h);
+   for (const { address } of addresses) {
+     if (isPrivateIp(address)) {
++      if (trustedCdn) continue;
+       throw new Error('域名解析到内网/本机地址，已阻止');
+     }
+   }
