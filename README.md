@@ -2,6 +2,22 @@
 
 在 macOS 上把 [DeepSeek Harness](https://github.com/deepseek-ai) 接进 QQ：会聊天、接梗、发表情包、发语音（可以克隆指定音色）、写空间说说。
 
+> ### 🤖 让 AI 自己装
+>
+> 这个仓库带 [AGENTS.md](AGENTS.md)——一份写给 **AI agent** 的作业书。
+> 把你的 AI 叫过来，丢这句话就行：
+>
+> ```text
+> https://github.com/jh6465xywq-sys/dsh-qq-macos
+> 按 AGENTS.md 帮我在 macOS 上部署一套。
+> 每一步都要验证，需要我配合的（比如扫码）停下来问我。
+> ```
+>
+> 它会自己跑环境自检、起容器、打补丁、接 DSH。
+> 只有**扫码登录 QQ** 那一步必须你来（手机扫码没法自动化）。
+>
+> 不想用 AI 就自己跑：`cp .env.example .env && bash deploy.sh`
+
 这不是源码包，是一份**流程 + 补丁**。跟着走大约 20 分钟能跑通，前提是你按顺序来。
 
 ---
