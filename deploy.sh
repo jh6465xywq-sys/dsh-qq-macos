@@ -32,6 +32,15 @@ FREE=$(df -g "$HOME" | tail -1 | awk '{print $4}')
 [ "${FREE:-0}" -ge 20 ] && ok "磁盘 ${FREE}GB" || warn "磁盘只剩 ${FREE}GB，建议 20GB+"
 [ -f .env ] && ok ".env 已存在" || warn "还没有 .env（cp .env.example .env 后填）"
 
+if command -v node >/dev/null; then ok "node $(node -v)"
+elif [ -x "/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin/node" ]; then
+  ok "node（DSH 内置）"; export PATH="/Applications/DeepSeek Harness.app/Contents/Resources/runtime/primary-runtime/dependencies/node/bin:$PATH"
+else bad "缺 node（第 3 步要用）→ 装 DSH 或 brew install node"; FAILED=1; fi
+
+command -v pnpm >/dev/null && ok "pnpm" || warn "缺 pnpm → corepack enable pnpm（第 3 步会自动尝试）"
+command -v docker >/dev/null && ok "docker" || warn "缺 docker → 第 1 步会装"
+command -v colima >/dev/null && ok "colima" || warn "缺 colima → 第 1 步会装"
+
 if [ "$CHECK_ONLY" -eq 1 ]; then
   echo; [ "$FAILED" -eq 0 ] && echo "自检通过，可以开工。" || echo "自检有问题，先修。"
   exit "$FAILED"
